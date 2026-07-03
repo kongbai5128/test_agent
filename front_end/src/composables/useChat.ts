@@ -21,6 +21,7 @@ export function useChat(sessionId: () => string | null) {
         ...m,
         status: 'done' as const,
         tool_calls: m.tool_calls ?? [],
+        attachments: m.attachments ?? [],
       }))
     } catch (e) {
       console.error('loadMessages error:', e)
