@@ -9,6 +9,7 @@
           :messages="messages"
           :is-loading="isLoading"
           :title="store.activeSession?.title"
+          :session-id="store.activeId"
           @send="handleSend"
         />
       </template>
@@ -26,6 +27,7 @@ import { useSessionStore } from './stores/sessions'
 import { useChat } from './composables/useChat'
 import SessionSidebar from './components/SessionSidebar.vue'
 import ChatWindow from './components/ChatWindow.vue'
+import type { SendPayload } from './types'
 
 const store = useSessionStore()
 const chatWindowRef = ref<InstanceType<typeof ChatWindow> | null>(null)
@@ -58,9 +60,9 @@ watch(
   { deep: true },
 )
 
-async function handleSend(text: string) {
+async function handleSend(payload: SendPayload) {
   if (!store.activeId) return
-  await sendMessage(text)
+  await sendMessage(payload.message, payload.attachments)
 }
 </script>
 

@@ -1,4 +1,4 @@
-import type { AgentEvent, DisplayMessage, Session } from '../types'
+import type { AgentEvent, DisplayMessage, DocumentAttachment, Session } from '../types'
 
 const BASE = '/api'
 
@@ -41,13 +41,64 @@ export const api = {
 
   getTrace: (id: string) => request<unknown[]>(`/sessions/${id}/trace`),
 
+  uploadDocument: (
+    sessionId: string,
+    file: File,
+    onProgress?: (progress: number) => void,
+  ) =>
+    uploadWithProgress<DocumentAttachment>(
+      `/sessions/${sessionId}/documents`,
+      file,
+      onProgress,
+    ),
+
+  deleteDocument: (sessionId: string, documentId: string) =>
+    fetch(`${BASE}/sessions/${sessionId}/documents/${documentId}`, { method: 'DELETE' }),
+
+  listDocuments: (sessionId: string) =>
+    request<DocumentAttachment[]>(`/sessions/${sessionId}/documents`),
+
   // SSE 聊天接口：返回原始 Response，由调用方处理流
-  chatStream: (id: string, message: string): Promise<Response> =>
+  chatStream: (id: string, message: string, documentIds: string[] = []): Promise<Response> =>
     fetch(`${BASE}/sessions/${id}/chat/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, document_ids: documentIds }),
     }),
+}
+
+function uploadWithProgress<T>(
+  url: string,
+  file: File,
+  onProgress?: (progress: number) => void,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    const form = new FormData()
+    form.append('file', file)
+
+    xhr.open('POST', BASE + url)
+
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return
+      onProgress?.(Math.round((event.loaded / event.total) * 100))
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as T)
+        } catch {
+          reject(new Error('上传响应解析失败'))
+        }
+      } else {
+        reject(new Error(`HTTP ${xhr.status}: ${xhr.responseText || xhr.statusText}`))
+      }
+    }
+
+    xhr.onerror = () => reject(new Error('文件上传失败'))
+    xhr.send(form)
+  })
 }
 
 /**

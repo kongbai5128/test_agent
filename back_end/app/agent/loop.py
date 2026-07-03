@@ -36,6 +36,8 @@ class ToolContext:
 
     session_id: str
     session_store: Any  # SessionStore，避免循环导入
+    memory_store: Any = None
+    document_store: Any = None
 
 
 async def run_agent_loop(
@@ -48,6 +50,8 @@ async def run_agent_loop(
     model: str,
     max_iterations: int,
     session_store: Any,
+    memory_store: Any,
+    document_store: Any,
     tool_traces: list[dict],
 ) -> AsyncGenerator[dict, None]:
     """
@@ -60,7 +64,12 @@ async def run_agent_loop(
     raw_messages.append({"role": "user", "content": user_input})
 
     tool_definitions = to_openai_tools()
-    tool_ctx = ToolContext(session_id=session_id, session_store=session_store)
+    tool_ctx = ToolContext(
+        session_id=session_id,
+        session_store=session_store,
+        memory_store=memory_store,
+        document_store=document_store,
+    )
 
     for iteration in range(max_iterations):
         # ── Step 2：调用 LLM ─────────────────────────────────────

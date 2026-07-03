@@ -39,7 +39,7 @@
             v-for="p in QUICK_PROMPTS"
             :key="p"
             class="quick-prompt-btn"
-            @click="$emit('send', p)"
+            @click="$emit('send', { message: p, attachments: [] })"
           >{{ p }}</button>
         </div>
       </div>
@@ -59,6 +59,7 @@
     <!-- 底部输入区 -->
     <InputArea
       :disabled="isLoading"
+      :session-id="sessionId"
       placeholder="输入消息…（支持多轮追问）"
       @send="$emit('send', $event)"
     />
@@ -69,16 +70,17 @@
 import { ref, watch, nextTick } from 'vue'
 import MessageItem from './MessageItem.vue'
 import InputArea from './InputArea.vue'
-import type { ChatMessage } from '../types'
+import type { ChatMessage, SendPayload } from '../types'
 
 defineProps<{
   messages: ChatMessage[]
   isLoading: boolean
   title?: string
+  sessionId: string
 }>()
 
 defineEmits<{
-  send: [message: string]
+  send: [payload: SendPayload]
 }>()
 
 const scrollRef = ref<HTMLDivElement | null>(null)
@@ -89,6 +91,8 @@ const TOOLS_INFO = [
   { name: 'search',     icon: '🔍', label: '搜索',   desc: '查询互联网信息（模拟）' },
   { name: 'weather',    icon: '🌤️', label: '天气',   desc: '查询城市实时天气（模拟）' },
   { name: 'todo',       icon: '📝', label: '待办',   desc: '管理本会话的待办事项' },
+  { name: 'read_docs',  icon: '📄', label: '文档',   desc: '读取 PDF / Word / 文本文件' },
+  { name: 'memory_save', icon: '🧠', label: '记忆',  desc: '保存长期偏好和项目背景' },
 ]
 
 const QUICK_PROMPTS = [

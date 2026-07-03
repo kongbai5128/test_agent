@@ -1,7 +1,7 @@
 import { nextTick, ref } from 'vue'
 import { api, parseSSEStream } from '../api'
 import { useSessionStore } from '../stores/sessions'
-import type { ChatMessage, ToolCallInfo } from '../types'
+import type { ChatMessage, DocumentAttachment, ToolCallInfo } from '../types'
 
 /**
  * Chat 逻辑 Composable。
@@ -28,9 +28,10 @@ export function useChat(sessionId: () => string | null) {
   }
 
   /** 发送消息，通过 SSE 流式接收 Agent 执行过程 */
-  async function sendMessage(content: string) {
+  async function sendMessage(content: string, attachments: DocumentAttachment[] = []) {
     const id = sessionId()
-    if (!id || isLoading.value || !content.trim()) return
+    const trimmed = content.trim()
+    if (!id || isLoading.value || (!trimmed && attachments.length === 0)) return
 
     isLoading.value = true
     streamError.value = null
@@ -39,9 +40,10 @@ export function useChat(sessionId: () => string | null) {
     const userMsg: ChatMessage = {
       id: `u-${Date.now()}`,
       role: 'user',
-      content: content.trim(),
+      content: trimmed || '请阅读并总结上传的文档。',
       thinking: null,
       tool_calls: [],
+      attachments,
       status: 'done',
     }
     messages.value.push(userMsg)
@@ -61,7 +63,11 @@ export function useChat(sessionId: () => string | null) {
     await nextTick()
 
     try {
-      const response = await api.chatStream(id, content.trim())
+      const response = await api.chatStream(
+        id,
+        trimmed,
+        attachments.map((item) => item.id),
+      )
 
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`)

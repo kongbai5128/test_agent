@@ -16,6 +16,7 @@ class Session:
     raw_messages: OpenAI 格式的原始消息列表，用于给 LLM 提供上下文。
     display_messages: 格式化的展示消息，供前端渲染。
     todos: 该会话的独立待办事项列表。
+    documents: 该会话上传过的文档元数据列表。
     tool_traces: 本会话所有工具调用的执行日志。
     """
 
@@ -24,6 +25,7 @@ class Session:
     raw_messages: list[dict]
     display_messages: list[dict]
     todos: list[dict]
+    documents: list[dict]
     created_at: str
     updated_at: str
     tool_traces: list[dict] = field(default_factory=list)
@@ -46,6 +48,7 @@ class SessionStore:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 # 兼容旧格式（缺少 todos 字段）
                 data.setdefault("todos", [])
+                data.setdefault("documents", [])
                 data.setdefault("display_messages", [])
                 data.setdefault("tool_traces", [])
                 data.setdefault("total_input_tokens", 0)
@@ -63,6 +66,7 @@ class SessionStore:
             raw_messages=[],
             display_messages=[],
             todos=[],
+            documents=[],
             created_at=now,
             updated_at=now,
         )

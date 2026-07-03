@@ -9,6 +9,8 @@ from openai import AsyncOpenAI
 
 from .api.routes import router
 from .config import load_config
+from .documents import DocumentStore
+from .memory import MemoryStore
 from .sessions.store import SessionStore
 
 # 加载所有工具（触发注册），需在 app 初始化前完成
@@ -34,6 +36,8 @@ async def lifespan(application: FastAPI):
         )
 
     application.state.session_store = SessionStore(cfg.data_dir / "sessions")
+    application.state.memory_store = MemoryStore(cfg.data_dir / "memory")
+    application.state.document_store = DocumentStore(cfg.data_dir / "docs")
     application.state.llm_client = AsyncOpenAI(
         api_key=cfg.api_key or "dummy-key",
         base_url=cfg.base_url,

@@ -28,6 +28,21 @@
         />
       </div>
 
+      <!-- 用户附件 -->
+      <div v-if="msg.attachments?.length" class="message__attachments">
+        <div
+          v-for="doc in msg.attachments"
+          :key="doc.id"
+          class="attachment-card"
+        >
+          <div class="attachment-card__icon">{{ fileIcon(doc.filename) }}</div>
+          <div class="attachment-card__main">
+            <div class="attachment-card__name" :title="doc.filename">{{ doc.filename }}</div>
+            <div class="attachment-card__meta">{{ formatSize(doc.size) }} · 已上传</div>
+          </div>
+        </div>
+      </div>
+
       <!-- 消息内容 -->
       <div class="message__content" :class="{ 'message__content--empty': !msg.content && msg.status === 'streaming' }">
         <span v-if="!msg.content && msg.status === 'streaming'" class="cursor-blink">▌</span>
@@ -45,6 +60,20 @@ import type { ChatMessage } from '../types'
 defineProps<{ msg: ChatMessage }>()
 
 const showThinking = ref(false)
+
+function formatSize(size: number): string {
+  if (size < 1024) return `${size} B`
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
+function fileIcon(filename: string): string {
+  const lower = filename.toLowerCase()
+  if (lower.endsWith('.pdf')) return 'PDF'
+  if (lower.endsWith('.doc') || lower.endsWith('.docx')) return 'DOC'
+  if (lower.endsWith('.md')) return 'MD'
+  return 'TXT'
+}
 </script>
 
 <style scoped>
@@ -146,6 +175,53 @@ const showThinking = ref(false)
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.message__attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.message--assistant .message__attachments {
+  justify-content: flex-start;
+}
+.attachment-card {
+  display: grid;
+  grid-template-columns: 38px minmax(120px, 220px);
+  gap: 8px;
+  align-items: center;
+  padding: 7px 9px 7px 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-surface);
+}
+.attachment-card__icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 7px;
+  background: var(--accent-light);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+}
+.attachment-card__main {
+  min-width: 0;
+}
+.attachment-card__name {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment-card__meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 /* 流式光标 */

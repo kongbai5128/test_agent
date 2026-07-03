@@ -3,16 +3,20 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
+from starlette.datastructures import UploadFile
 
 from ..agent.loop import run_agent_loop
 from ..agent.system_prompt import SYSTEM_PROMPT
 from ..context import manager as ctx_manager
+from ..documents import Document, DocumentStore
+from ..memory import MEMORY_TYPES, Memory, MemoryStore, build_memory_block
 from ..sessions.store import Session, SessionStore
 
 logger = logging.getLogger(__name__)
@@ -24,6 +28,14 @@ router = APIRouter(prefix="/api")
 
 def get_store(request: Request) -> SessionStore:
     return request.app.state.session_store
+
+
+def get_memory_store(request: Request) -> MemoryStore:
+    return request.app.state.memory_store
+
+
+def get_document_store(request: Request) -> DocumentStore:
+    return request.app.state.document_store
 
 
 def get_client(request: Request) -> AsyncOpenAI:
@@ -49,7 +61,15 @@ class UpdateSessionRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=8000)
+    message: str = Field(default="", max_length=8000)
+    document_ids: list[str] = Field(default_factory=list, max_length=8)
+
+
+class CreateMemoryRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=4000)
+    type: str = Field(default="project")
+    tags: list[str] = Field(default_factory=list)
+    importance: int = Field(default=3, ge=1, le=5)
 
 
 # ── Session 路由 ───────────────────────────────────────────────
@@ -78,6 +98,7 @@ async def get_session(
         **_session_summary(session),
         "display_messages": session.display_messages,
         "todos": session.todos,
+        "documents": session.documents,
     }
 
 
@@ -97,9 +118,11 @@ async def update_session(
 async def delete_session(
     session_id: str,
     store: SessionStore = Depends(get_store),
+    document_store: DocumentStore = Depends(get_document_store),
 ):
     if not store.delete(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
+    document_store.delete_session(session_id)
 
 
 # ── Chat 路由（SSE 流式）──────────────────────────────────────
@@ -112,6 +135,8 @@ async def chat_stream(
     client: AsyncOpenAI = Depends(get_client),
     model: str = Depends(get_model),
     max_iter: int = Depends(get_max_iter),
+    memory_store: MemoryStore = Depends(get_memory_store),
+    document_store: DocumentStore = Depends(get_document_store),
 ):
     """
     发送消息并以 SSE 格式实时流式返回 Agent 执行过程。
@@ -126,6 +151,15 @@ async def chat_stream(
     """
     session = _get_or_404(store, session_id)
     user_input = body.message.strip()
+    attached_docs = _get_attached_documents(
+        document_store,
+        session_id,
+        body.document_ids,
+    )
+    if not user_input and attached_docs:
+        user_input = "请阅读并总结上传的文档。"
+    if not user_input:
+        raise HTTPException(status_code=422, detail="message 或 document_ids 不能为空")
 
     # 超轮次触发 context 压缩
     if ctx_manager.count_user_turns(session.raw_messages) >= ctx_manager.MAX_ROUNDS:
@@ -148,6 +182,7 @@ async def chat_stream(
         "content": user_input,
         "thinking": None,
         "tool_calls": [],
+        "attachments": [_document_response(doc) for doc in attached_docs],
     }
     session.display_messages.append(user_display_msg)
 
@@ -163,6 +198,8 @@ async def chat_stream(
     # raw_messages 由 run_agent_loop 就地修改
     raw_messages = session.raw_messages
     new_traces: list[dict] = []
+    system_prompt = _with_relevant_memories(SYSTEM_PROMPT, memory_store, user_input)
+    system_prompt = _with_attached_documents(system_prompt, attached_docs)
 
     async def event_generator():
         try:
@@ -170,11 +207,13 @@ async def chat_stream(
                 session_id=session_id,
                 user_input=user_input,
                 raw_messages=raw_messages,
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 client=client,
                 model=model,
                 max_iterations=max_iter,
                 session_store=store,
+                memory_store=memory_store,
+                document_store=document_store,
                 tool_traces=new_traces,
             ):
                 # 同步更新 assistant_display_msg
@@ -204,6 +243,71 @@ async def chat_stream(
     )
 
 
+# ── 文档上传 ───────────────────────────────────────────────────
+
+@router.post("/sessions/{session_id}/documents", status_code=201)
+async def upload_document(
+    session_id: str,
+    request: Request,
+    store: SessionStore = Depends(get_store),
+    document_store: DocumentStore = Depends(get_document_store),
+):
+    session = _get_or_404(store, session_id)
+    try:
+        form = await request.form()
+    except AssertionError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="文件上传需要安装 python-multipart",
+        ) from exc
+
+    upload = form.get("file")
+    if not isinstance(upload, UploadFile):
+        raise HTTPException(status_code=400, detail="缺少文件字段 file")
+
+    try:
+        document = document_store.save_upload(
+            session_id=session_id,
+            filename=upload.filename or "document",
+            content_type=upload.content_type or "application/octet-stream",
+            fileobj=upload.file,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        await upload.close()
+
+    session.documents = _merge_documents(session.documents, [document])
+    store.save(session)
+    return _document_response(document)
+
+
+@router.get("/sessions/{session_id}/documents")
+async def list_documents(
+    session_id: str,
+    store: SessionStore = Depends(get_store),
+    document_store: DocumentStore = Depends(get_document_store),
+):
+    _get_or_404(store, session_id)
+    return [_document_response(doc) for doc in document_store.list_for_session(session_id)]
+
+
+@router.delete("/sessions/{session_id}/documents/{document_id}", status_code=204)
+async def delete_document(
+    session_id: str,
+    document_id: str,
+    store: SessionStore = Depends(get_store),
+    document_store: DocumentStore = Depends(get_document_store),
+):
+    session = _get_or_404(store, session_id)
+    if not document_store.delete(session_id, document_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+    session.documents = [
+        doc for doc in session.documents if doc.get("id") != document_id
+    ]
+    store.save(session)
+
+
 @router.get("/sessions/{session_id}/messages")
 async def get_messages(
     session_id: str,
@@ -231,6 +335,56 @@ async def get_todos(
 ):
     session = _get_or_404(store, session_id)
     return session.todos
+
+
+# ── 长期记忆 ───────────────────────────────────────────────────
+
+@router.get("/memories")
+async def list_memories(
+    query: Optional[str] = None,
+    limit: int = 20,
+    memory_store: MemoryStore = Depends(get_memory_store),
+):
+    limit = max(1, min(limit, 100))
+    if query and query.strip():
+        memories = memory_store.find_relevant(query.strip(), top_k=limit)
+    else:
+        memories = memory_store.load_all()[:limit]
+    return [_memory_response(memory) for memory in memories]
+
+
+@router.post("/memories", status_code=201)
+async def create_memory(
+    body: CreateMemoryRequest,
+    memory_store: MemoryStore = Depends(get_memory_store),
+):
+    mem_type = body.type.strip() or "project"
+    if mem_type not in MEMORY_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"type must be one of {list(MEMORY_TYPES)}",
+        )
+
+    memory = Memory(
+        id=f"mem-{uuid.uuid4().hex[:8]}",
+        content=body.content.strip(),
+        tags=[tag.strip() for tag in body.tags if tag.strip()],
+        created_at=datetime.now(timezone.utc).isoformat(),
+        source_session="manual",
+        importance=body.importance,
+        type=mem_type,
+    )
+    memory_store.save(memory)
+    return _memory_response(memory)
+
+
+@router.delete("/memories/{memory_id}", status_code=204)
+async def delete_memory(
+    memory_id: str,
+    memory_store: MemoryStore = Depends(get_memory_store),
+):
+    if not memory_store.delete(memory_id):
+        raise HTTPException(status_code=404, detail="Memory not found")
 
 
 # ── 健康检查 ───────────────────────────────────────────────────
@@ -269,6 +423,78 @@ def _session_summary(session: Session) -> dict:
         "updated_at": session.updated_at,
         "message_count": len(session.display_messages),
     }
+
+
+def _memory_response(memory: Memory) -> dict:
+    return memory.to_dict()
+
+
+def _document_response(document: Document) -> dict:
+    return {
+        "id": document.id,
+        "session_id": document.session_id,
+        "filename": document.filename,
+        "content_type": document.content_type,
+        "size": document.size,
+        "created_at": document.created_at,
+        "status": document.status,
+    }
+
+
+def _merge_documents(existing: list[dict], documents: list[Document]) -> list[dict]:
+    by_id = {doc.get("id"): doc for doc in existing if doc.get("id")}
+    for document in documents:
+        by_id[document.id] = _document_response(document)
+    return sorted(
+        by_id.values(),
+        key=lambda item: item.get("created_at", ""),
+        reverse=True,
+    )
+
+
+def _get_attached_documents(
+    document_store: DocumentStore,
+    session_id: str,
+    document_ids: list[str],
+) -> list[Document]:
+    if not document_ids:
+        return []
+    documents = document_store.get_many(session_id, document_ids)
+    found_ids = {doc.id for doc in documents}
+    missing = [doc_id for doc_id in document_ids if doc_id not in found_ids]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {', '.join(missing)}",
+        )
+    return documents
+
+
+def _with_relevant_memories(
+    base_prompt: str,
+    memory_store: MemoryStore,
+    user_input: str,
+) -> str:
+    memory_block = build_memory_block(user_input, memory_store, top_k=3)
+    if not memory_block:
+        return base_prompt
+    return f"{base_prompt}\n\n{memory_block}"
+
+
+def _with_attached_documents(base_prompt: str, documents: list[Document]) -> str:
+    if not documents:
+        return base_prompt
+
+    lines = [
+        "[本轮上传文档]",
+        "用户本轮消息附带了以下文档。需要读取正文时，请调用 read_docs，并优先使用 document_id 参数。",
+    ]
+    for doc in documents:
+        lines.append(
+            f"- document_id={doc.id} filename={doc.filename} "
+            f"size={doc.size} content_type={doc.content_type}"
+        )
+    return base_prompt + "\n\n" + "\n".join(lines)
 
 
 def _apply_event_to_display(event: dict, assistant_msg: dict) -> None:

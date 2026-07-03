@@ -8,6 +8,32 @@ export interface Session {
   message_count: number
 }
 
+export interface DocumentAttachment {
+  id: string
+  session_id: string
+  filename: string
+  content_type: string
+  size: number
+  created_at: string
+  status: 'ready' | 'processing' | 'error' | string
+}
+
+export interface UploadItem {
+  localId: string
+  file: File
+  filename: string
+  size: number
+  progress: number
+  status: 'queued' | 'uploading' | 'ready' | 'error'
+  error: string | null
+  document: DocumentAttachment | null
+}
+
+export interface SendPayload {
+  message: string
+  attachments: DocumentAttachment[]
+}
+
 export interface ToolCallInfo {
   tool: string
   params: Record<string, unknown>
@@ -20,6 +46,7 @@ export interface DisplayMessage {
   content: string
   thinking: string | null
   tool_calls: ToolCallInfo[]
+  attachments?: DocumentAttachment[]
 }
 
 // SSE 事件类型
@@ -42,6 +69,8 @@ export const TOOL_ICONS: Record<string, string> = {
   search: '🔍',
   weather: '🌤️',
   todo: '📝',
+  read_docs: '📄',
+  memory_save: '🧠',
 }
 
 export const TOOL_LABELS: Record<string, string> = {
@@ -49,4 +78,6 @@ export const TOOL_LABELS: Record<string, string> = {
   search: '搜索',
   weather: '天气',
   todo: '待办',
+  read_docs: '文档读取',
+  memory_save: '长期记忆',
 }
