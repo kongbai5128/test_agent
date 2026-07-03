@@ -37,7 +37,7 @@ async def lifespan(application: FastAPI):
 
     application.state.session_store = SessionStore(cfg.data_dir / "sessions")
     application.state.memory_store = MemoryStore(cfg.data_dir / "memory")
-    application.state.document_store = DocumentStore(cfg.data_dir / "docs")
+    application.state.document_store = DocumentStore(cfg.data_dir / "doc")
     application.state.llm_client = AsyncOpenAI(
         api_key=cfg.api_key or "dummy-key",
         base_url=cfg.base_url,

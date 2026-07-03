@@ -46,20 +46,37 @@
       <!-- 消息内容 -->
       <div class="message__content" :class="{ 'message__content--empty': !msg.content && msg.status === 'streaming' }">
         <span v-if="!msg.content && msg.status === 'streaming'" class="cursor-blink">▌</span>
-        <span v-else>{{ msg.content }}</span>
+        <div v-else class="markdown-body" v-html="renderedContent" />
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
+import MarkdownIt from 'markdown-it'
 import ToolCallCard from './ToolCallCard.vue'
 import type { ChatMessage } from '../types'
 
-defineProps<{ msg: ChatMessage }>()
+const props = defineProps<{ msg: ChatMessage }>()
 
 const showThinking = ref(false)
+const markdown = new MarkdownIt({
+  html: false,
+  linkify: true,
+  breaks: true,
+})
+
+const defaultLinkOpen = markdown.renderer.rules.link_open
+markdown.renderer.rules.link_open = (tokens, idx, options, env, self) => {
+  tokens[idx].attrSet('target', '_blank')
+  tokens[idx].attrSet('rel', 'noopener noreferrer')
+  return defaultLinkOpen
+    ? defaultLinkOpen(tokens, idx, options, env, self)
+    : self.renderToken(tokens, idx, options)
+}
+
+const renderedContent = computed(() => markdown.render(props.msg.content || ''))
 
 function formatSize(size: number): string {
   if (size < 1024) return `${size} B`
@@ -134,12 +151,103 @@ function fileIcon(filename: string): string {
 .message__content {
   padding: 10px 14px;
   line-height: 1.65;
-  white-space: pre-wrap;
   word-break: break-word;
   font-size: 14.5px;
+  overflow-x: auto;
 }
 .message__content--empty {
   min-height: 38px;
+}
+.markdown-body {
+  max-width: 100%;
+}
+.markdown-body :deep(*) {
+  max-width: 100%;
+}
+.markdown-body :deep(> :first-child) {
+  margin-top: 0;
+}
+.markdown-body :deep(> :last-child) {
+  margin-bottom: 0;
+}
+.markdown-body :deep(h1),
+.markdown-body :deep(h2),
+.markdown-body :deep(h3),
+.markdown-body :deep(h4) {
+  margin: 0.65em 0 0.35em;
+  line-height: 1.3;
+  font-weight: 700;
+}
+.markdown-body :deep(h1) {
+  font-size: 1.35em;
+}
+.markdown-body :deep(h2) {
+  font-size: 1.2em;
+}
+.markdown-body :deep(h3) {
+  font-size: 1.08em;
+}
+.markdown-body :deep(p),
+.markdown-body :deep(ul),
+.markdown-body :deep(ol),
+.markdown-body :deep(blockquote),
+.markdown-body :deep(pre),
+.markdown-body :deep(table) {
+  margin: 0.45em 0;
+}
+.markdown-body :deep(ul),
+.markdown-body :deep(ol) {
+  padding-left: 1.4em;
+}
+.markdown-body :deep(li + li) {
+  margin-top: 0.2em;
+}
+.markdown-body :deep(table) {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+.markdown-body :deep(th),
+.markdown-body :deep(td) {
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+.markdown-body :deep(th) {
+  background: var(--bg-hover);
+  font-weight: 700;
+}
+.markdown-body :deep(code) {
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: var(--bg-code);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.92em;
+}
+.markdown-body :deep(pre) {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-code);
+  overflow-x: auto;
+}
+.markdown-body :deep(pre code) {
+  padding: 0;
+  background: transparent;
+  white-space: pre;
+}
+.markdown-body :deep(blockquote) {
+  padding-left: 10px;
+  border-left: 3px solid var(--border);
+  color: var(--text-muted);
+}
+.markdown-body :deep(a) {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 /* 思考过程 */

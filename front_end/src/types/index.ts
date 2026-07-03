@@ -15,7 +15,7 @@ export interface DocumentAttachment {
   content_type: string
   size: number
   created_at: string
-  status: 'ready' | 'processing' | 'error' | string
+  status: 'ready' | string
 }
 
 export interface UploadItem {

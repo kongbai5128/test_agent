@@ -46,7 +46,7 @@
       <button
         class="attach-btn"
         type="button"
-        :disabled="disabled || !sessionId || hasUploading"
+        :disabled="disabled || !sessionId || hasBlockingUpload"
         title="添加文件"
         @click="openFilePicker"
       >
@@ -65,9 +65,10 @@
       />
       <button
         class="send-btn"
+        type="button"
         :disabled="disabled || !canSend"
         @click="handleSend"
-        :title="disabled ? '正在处理…' : '发送 (Enter)'"
+        :title="sendTitle"
       >
         <span v-if="disabled" class="send-spinner" />
         <span v-else>↑</span>
@@ -99,19 +100,27 @@ const textareaRef = ref<HTMLTextAreaElement | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const attachments = ref<UploadItem[]>([])
 
-const hasUploading = computed(() =>
+const hasBlockingUpload = computed(() =>
   attachments.value.some((item) => item.status === 'queued' || item.status === 'uploading'),
 )
 
 const readyAttachments = computed(() =>
   attachments.value
-    .filter((item) => item.status === 'ready' && item.document)
+    .filter(isReadyUpload)
     .map((item) => item.document as DocumentAttachment),
 )
 
 const canSend = computed(() =>
-  !hasUploading.value && (inputText.value.trim().length > 0 || readyAttachments.value.length > 0),
+  !hasBlockingUpload.value &&
+  (inputText.value.trim().length > 0 || readyAttachments.value.length > 0),
 )
+
+const sendTitle = computed(() => {
+  if (props.disabled) return '正在处理…'
+  if (hasBlockingUpload.value) return '文件上传中，完成后才能发送'
+  if (canSend.value) return '发送 (Enter)'
+  return '输入消息或添加已就绪文件'
+})
 
 function openFilePicker() {
   fileInputRef.value?.click()
@@ -136,34 +145,59 @@ async function handleFiles(event: Event) {
       document: null,
     }
     attachments.value.push(item)
-    uploadItem(item)
+    uploadItem(attachments.value[attachments.value.length - 1])
   }
 }
 
 async function uploadItem(item: UploadItem) {
-  if (!props.sessionId) return
+  const sessionId = props.sessionId
+  if (!sessionId) return
   item.status = 'uploading'
+  item.progress = 8
+
   try {
-    item.document = await api.uploadDocument(props.sessionId, item.file, (progress) => {
-      item.progress = progress
+    const document = await api.uploadDocument(sessionId, item.file, (progress) => {
+      item.progress = Math.max(item.progress, progress)
     })
+    if (!document.id) {
+      throw new Error('上传响应缺少文档 ID')
+    }
+    item.document = document
     item.progress = 100
     item.status = 'ready'
+    item.error = null
   } catch (error) {
     item.status = 'error'
+    item.progress = 100
     item.error = normalizeError(error)
   }
+}
+
+function isReadyUpload(item: UploadItem): boolean {
+  return item.status === 'ready' && Boolean(item.document?.id)
 }
 
 async function handleSend() {
   const text = inputText.value.trim()
   if (!canSend.value) return
   const docs = readyAttachments.value
+  const sentIds = new Set(docs.map((doc) => doc.id))
+  const payload: SendPayload = { message: text, attachments: docs }
+
+  emit('send', payload)
+
   inputText.value = ''
-  attachments.value = attachments.value.filter((item) => item.status === 'error')
+  attachments.value = attachments.value.filter((item) => {
+    if (item.status === 'error' || item.status === 'queued' || item.status === 'uploading') {
+      return true
+    }
+    if (item.status === 'ready' && !item.document?.id) {
+      return false
+    }
+    return item.document ? !sentIds.has(item.document.id) : false
+  })
   await nextTick()
   autoResize()
-  emit('send', { message: text, attachments: docs })
 }
 
 function autoResize() {
@@ -213,7 +247,7 @@ function fileIcon(filename: string): string {
 function statusText(item: UploadItem): string {
   if (item.status === 'queued') return '等待上传'
   if (item.status === 'uploading') return `上传中 ${item.progress}%`
-  if (item.status === 'ready') return '已就绪'
+  if (isReadyUpload(item)) return '已就绪'
   return '失败'
 }
 </script>

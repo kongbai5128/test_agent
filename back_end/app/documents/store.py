@@ -53,6 +53,7 @@ class DocumentStore:
     def __init__(self, docs_dir: Path) -> None:
         self.docs_dir = docs_dir
         self.docs_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_docs_dir()
 
     def session_dir(self, session_id: str) -> Path:
         path = self.docs_dir / session_id
@@ -109,7 +110,8 @@ class DocumentStore:
         if not meta_path.exists():
             return None
         try:
-            return Document.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
+            document = Document.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
+            return self._normalize_document_path(document)
         except Exception:
             return None
 
@@ -132,9 +134,10 @@ class DocumentStore:
         docs: list[Document] = []
         for meta_path in sorted(root.glob("*/meta.json")):
             try:
-                docs.append(
-                    Document.from_dict(json.loads(meta_path.read_text(encoding="utf-8")))
+                document = Document.from_dict(
+                    json.loads(meta_path.read_text(encoding="utf-8"))
                 )
+                docs.append(self._normalize_document_path(document))
             except Exception:
                 continue
         return sorted(docs, key=lambda item: item.created_at, reverse=True)
@@ -168,3 +171,32 @@ class DocumentStore:
             json.dumps(document.to_dict(), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
+    def _normalize_document_path(self, document: Document) -> Document:
+        path = Path(document.path)
+        if path.exists():
+            return document
+
+        fallback = self.docs_dir / document.session_id / document.id / document.stored_name
+        if fallback.exists():
+            document.path = str(fallback)
+            self._write_meta(document)
+        return document
+
+    def _migrate_legacy_docs_dir(self) -> None:
+        legacy_dir = self.docs_dir.parent / "docs"
+        if not legacy_dir.exists() or legacy_dir.resolve() == self.docs_dir.resolve():
+            return
+
+        for session_dir in legacy_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+            target_session_dir = self.docs_dir / session_dir.name
+            target_session_dir.mkdir(parents=True, exist_ok=True)
+            for doc_dir in session_dir.iterdir():
+                if not doc_dir.is_dir():
+                    continue
+                target_doc_dir = target_session_dir / doc_dir.name
+                if target_doc_dir.exists():
+                    continue
+                shutil.move(str(doc_dir), str(target_doc_dir))

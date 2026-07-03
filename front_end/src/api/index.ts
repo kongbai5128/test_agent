@@ -86,14 +86,15 @@ function uploadWithProgress<T>(
 
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress?.(100)
         try {
           resolve(JSON.parse(xhr.responseText) as T)
         } catch {
           reject(new Error('上传响应解析失败'))
         }
-      } else {
-        reject(new Error(`HTTP ${xhr.status}: ${xhr.responseText || xhr.statusText}`))
+        return
       }
+      reject(new Error(`HTTP ${xhr.status}: ${xhr.responseText || xhr.statusText}`))
     }
 
     xhr.onerror = () => reject(new Error('文件上传失败'))

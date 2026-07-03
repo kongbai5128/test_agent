@@ -156,6 +156,13 @@ async def chat_stream(
         session_id,
         body.document_ids,
     )
+    if not attached_docs:
+        attached_docs = _infer_recent_documents(
+            session,
+            document_store,
+            session_id,
+            user_input,
+        )
     if not user_input and attached_docs:
         user_input = "请阅读并总结上传的文档。"
     if not user_input:
@@ -467,7 +474,55 @@ def _get_attached_documents(
             status_code=404,
             detail=f"Document not found: {', '.join(missing)}",
         )
+    not_ready = [doc.filename for doc in documents if doc.status != "ready"]
+    if not_ready:
+        raise HTTPException(
+            status_code=409,
+            detail=f"文档仍在上传或处理：{', '.join(not_ready)}",
+        )
     return documents
+
+
+def _infer_recent_documents(
+    session: Session,
+    document_store: DocumentStore,
+    session_id: str,
+    user_input: str,
+) -> list[Document]:
+    if not _looks_like_document_request(user_input):
+        return []
+
+    latest_doc_id = ""
+    if session.documents:
+        latest_doc_id = session.documents[0].get("id", "")
+
+    if latest_doc_id:
+        document = document_store.get(session_id, latest_doc_id)
+        if document is not None and document.status == "ready":
+            return [document]
+
+    docs = document_store.list_for_session(session_id)
+    return [doc for doc in docs if doc.status == "ready"][:1]
+
+
+def _looks_like_document_request(user_input: str) -> bool:
+    text = user_input.strip().lower()
+    if not text:
+        return False
+    keywords = (
+        "这篇",
+        "这份",
+        "这个文件",
+        "这个文档",
+        "这篇文章",
+        "文章",
+        "文档",
+        "文件",
+        "附件",
+        "pdf",
+        "论文",
+    )
+    return any(keyword in text for keyword in keywords)
 
 
 def _with_relevant_memories(
