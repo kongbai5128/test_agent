@@ -11,13 +11,37 @@ from __future__ import annotations
 import json
 import os
 import re
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
 MemoryType = Literal["user", "feedback", "project", "reference"]
+
+DREAM_MIN_HOURS_SINCE_LAST = 24
+SESSION_DIGEST_MAX_CHARS = 24_000
+
+_CONSOLIDATE_SYSTEM_PROMPT = """\
+你是一个长期记忆整合助手。只输出 JSON，不输出 Markdown 或解释。
+
+请从会话记录中提取未来仍有价值的信息，并整理为长期记忆。
+
+记忆类型：
+- feedback：用户纠正过助手的做法，或明确确认某种做法有效。最重要。
+- user：用户身份、背景、长期偏好。
+- project：项目背景、关键决策、当前状态。不要保存能直接从代码读取的信息。
+- reference：外部资源、路径、工具位置等指针。
+
+不要保存：
+- 临时任务状态、一次性对话流水。
+- 可以直接从代码或文件系统读取的普通路径清单。
+- 重复或低价值内容。
+
+输出格式：
+{"memories":[{"type":"project","content":"记忆内容","tags":["标签"],"importance":3}]}
+""".strip()
 
 
 @dataclass
@@ -228,6 +252,17 @@ class MemoryStore:
             encoding="utf-8",
         )
 
+    def update_consolidation_timestamp(self, session_count: int) -> None:
+        index = MemoryIndex(
+            last_consolidated_at=datetime.now(timezone.utc).isoformat(),
+            total_memories=len(self.load_all()),
+            session_count_at_last_consolidation=session_count,
+        )
+        self.index_file.write_text(
+            json.dumps(index.to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
 
 def build_memory_block(query: str, store: MemoryStore, top_k: int = 3) -> str:
     if query:
@@ -251,3 +286,228 @@ def build_memory_block(query: str, store: MemoryStore, top_k: int = 3) -> str:
         tags = f" tags={','.join(memory.tags)}" if memory.tags else ""
         lines.append(f"- [{memory.type}{tags}] {memory.content}{age}")
     return "\n".join(lines)
+
+
+def count_non_empty_sessions(session_store: Any) -> int:
+    return sum(1 for session in session_store.list_all() if session.raw_messages)
+
+
+def should_consolidate_sessions(
+    session_store: Any,
+    memory_store: MemoryStore,
+    *,
+    min_hours_since_last: int = DREAM_MIN_HOURS_SINCE_LAST,
+) -> bool:
+    sessions = [session for session in session_store.list_all() if session.raw_messages]
+    current_count = len(sessions)
+    if current_count <= 0:
+        return False
+
+    index = memory_store.get_index()
+    if not index.last_consolidated_at:
+        return True
+
+    try:
+        last = _parse_datetime(index.last_consolidated_at)
+        hours = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+        if hours < min_hours_since_last:
+            return False
+    except Exception:
+        return True
+
+    has_new_session = current_count > index.session_count_at_last_consolidation
+    has_updated_session = any(
+        _parse_datetime(session.updated_at) > last for session in sessions
+    )
+    return has_new_session or has_updated_session
+
+
+def format_session_digest(session: Any) -> str:
+    lines: list[str] = [f"=== 会话 {session.id}：{session.title} ==="]
+    messages = session.raw_messages or []
+
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        if role == "user" and isinstance(content, str) and content.strip():
+            lines.append(f"[用户] {_trim_text(content, 800)}")
+        elif role == "assistant":
+            if isinstance(content, str) and content.strip():
+                lines.append(f"[助手] {_trim_text(content, 400)}")
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls:
+                names = [
+                    call.get("function", {}).get("name", "?")
+                    for call in tool_calls
+                    if isinstance(call, dict)
+                ]
+                if names:
+                    lines.append(f"[工具调用] {', '.join(names)}")
+        elif role == "tool" and isinstance(content, str):
+            lowered = content.lower()
+            if any(word in lowered for word in ("错误", "error", "失败", "failed")):
+                lines.append(f"[工具错误] {_trim_text(content, 300)}")
+
+    if len(lines) == 1:
+        for msg in session.display_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if (
+                role in {"user", "assistant"}
+                and isinstance(content, str)
+                and content.strip()
+            ):
+                label = "用户" if role == "user" else "助手"
+                lines.append(f"[{label}] {_trim_text(content, 500)}")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def build_sessions_digest(
+    session_store: Any,
+    *,
+    max_chars: int = SESSION_DIGEST_MAX_CHARS,
+) -> str:
+    chunks: list[str] = []
+    total = 0
+    for session in session_store.list_all():
+        digest = format_session_digest(session)
+        if not digest:
+            continue
+        if total + len(digest) > max_chars:
+            remaining = max_chars - total
+            if remaining > 500:
+                chunks.append(digest[:remaining] + "\n...[已截断]")
+            break
+        chunks.append(digest)
+        total += len(digest)
+    return "\n\n".join(chunks)
+
+
+async def consolidate_sessions_to_memory(
+    *,
+    client: Any,
+    model: str,
+    session_store: Any,
+    memory_store: MemoryStore,
+    force: bool = False,
+) -> dict:
+    if not force and not should_consolidate_sessions(session_store, memory_store):
+        return {
+            "status": "skipped",
+            "reason": "未达到自动整合条件",
+            "created": 0,
+            "memory_ids": [],
+        }
+
+    session_digest = build_sessions_digest(session_store)
+    if not session_digest:
+        memory_store.update_consolidation_timestamp(count_non_empty_sessions(session_store))
+        return {
+            "status": "skipped",
+            "reason": "没有可整合的会话内容",
+            "created": 0,
+            "memory_ids": [],
+        }
+
+    existing = [
+        {"id": m.id, "type": m.type, "content": m.content, "tags": m.tags}
+        for m in memory_store.load_all()
+    ]
+    prompt = (
+        "现有长期记忆：\n"
+        f"{json.dumps(existing, ensure_ascii=False)}\n\n"
+        "待整合会话：\n"
+        f"{session_digest}"
+    )
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _CONSOLIDATE_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=2048,
+        temperature=0.2,
+    )
+    raw = response.choices[0].message.content or ""
+    data = _parse_json_object(raw)
+    items = data.get("memories", [])
+    if not isinstance(items, list):
+        items = []
+
+    saved_ids: list[str] = []
+    existing_contents = {_normalize_text(m.content) for m in memory_store.load_all()}
+    for item in items:
+        memory = _memory_from_model_item(item)
+        if memory is None:
+            continue
+        normalized = _normalize_text(memory.content)
+        if normalized in existing_contents:
+            continue
+        memory_store.save(memory)
+        existing_contents.add(normalized)
+        saved_ids.append(memory.id)
+
+    session_count = count_non_empty_sessions(session_store)
+    memory_store.update_consolidation_timestamp(session_count)
+    return {
+        "status": "ok",
+        "created": len(saved_ids),
+        "memory_ids": saved_ids,
+        "session_count": session_count,
+    }
+
+
+def _trim_text(text: str, limit: int) -> str:
+    clean = text.strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit] + "..."
+
+
+def _parse_json_object(text: str) -> dict:
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        data = json.loads(match.group())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _memory_from_model_item(item: Any) -> Memory | None:
+    if not isinstance(item, dict):
+        return None
+
+    content = str(item.get("content", "")).strip()
+    if not content:
+        return None
+
+    mem_type = str(item.get("type", "project")).strip() or "project"
+    if mem_type not in MEMORY_TYPES:
+        mem_type = "project"
+
+    raw_tags = item.get("tags", [])
+    tags = (
+        [str(tag).strip() for tag in raw_tags if str(tag).strip()]
+        if isinstance(raw_tags, list)
+        else []
+    )
+    try:
+        importance = int(item.get("importance", 3))
+    except (TypeError, ValueError):
+        importance = 3
+    importance = max(1, min(5, importance))
+
+    return Memory(
+        id=f"mem-{uuid.uuid4().hex[:8]}",
+        content=content,
+        tags=tags,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        source_session="auto_consolidate",
+        importance=importance,
+        type=mem_type,
+    )

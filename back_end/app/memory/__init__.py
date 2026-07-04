@@ -4,7 +4,9 @@ from .store import (
     MemoryIndex,
     MemoryStore,
     build_memory_block,
+    consolidate_sessions_to_memory,
     memory_age_text,
+    should_consolidate_sessions,
 )
 
 __all__ = [
@@ -13,5 +15,7 @@ __all__ = [
     "MemoryIndex",
     "MemoryStore",
     "build_memory_block",
+    "consolidate_sessions_to_memory",
     "memory_age_text",
+    "should_consolidate_sessions",
 ]

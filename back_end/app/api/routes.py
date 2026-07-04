@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
 import logging
 import uuid
@@ -16,7 +18,14 @@ from ..agent.loop import run_agent_loop
 from ..agent.system_prompt import SYSTEM_PROMPT
 from ..context import manager as ctx_manager
 from ..documents import Document, DocumentStore
-from ..memory import MEMORY_TYPES, Memory, MemoryStore, build_memory_block
+from ..memory import (
+    MEMORY_TYPES,
+    Memory,
+    MemoryStore,
+    build_memory_block,
+    consolidate_sessions_to_memory,
+    should_consolidate_sessions,
+)
 from ..sessions.store import Session, SessionStore
 
 logger = logging.getLogger(__name__)
@@ -166,23 +175,26 @@ async def chat_stream(
     if not user_input and attached_docs:
         user_input = "请阅读并总结上传的文档。"
     if not user_input:
-        raise HTTPException(status_code=422, detail="message 或 document_ids 不能为空")
+        raise HTTPException(status_code=422, detail="message 不能为空")
 
     # 超轮次触发 context 压缩
     if ctx_manager.count_user_turns(session.raw_messages) >= ctx_manager.MAX_ROUNDS:
         session.raw_messages = ctx_manager.compress(
-            session.raw_messages, SYSTEM_PROMPT
+            session.raw_messages, SYSTEM_PROMPT, force=True
         )
     elif ctx_manager.should_compress(session.raw_messages, SYSTEM_PROMPT):
         session.raw_messages = ctx_manager.compress(
             session.raw_messages, SYSTEM_PROMPT
         )
+    else:
+        session.raw_messages = ctx_manager.sanitize_chat_messages(session.raw_messages)
 
-    # 会话首条消息时自动设置标题
+    # 会话首条消息时自动设置标题；成功后再真正写入 session。
+    pending_title = session.title
     if not session.raw_messages and session.title.startswith("新对话"):
-        session.title = user_input[:30] + ("…" if len(user_input) > 30 else "")
+        pending_title = user_input[:30] + ("…" if len(user_input) > 30 else "")
 
-    # 构建本轮 display 消息（user 部分先添加）
+    # 构建本轮 display 消息；等本轮成功结束后再统一提交。
     user_display_msg = {
         "id": uuid.uuid4().hex[:8],
         "role": "user",
@@ -191,7 +203,6 @@ async def chat_stream(
         "tool_calls": [],
         "attachments": [_document_response(doc) for doc in attached_docs],
     }
-    session.display_messages.append(user_display_msg)
 
     # 构建待填充的 assistant display 消息
     assistant_display_msg: dict = {
@@ -204,11 +215,14 @@ async def chat_stream(
 
     # raw_messages 由 run_agent_loop 就地修改
     raw_messages = session.raw_messages
+    raw_messages_before_turn = copy.deepcopy(raw_messages)
     new_traces: list[dict] = []
+    had_error = False
     system_prompt = _with_relevant_memories(SYSTEM_PROMPT, memory_store, user_input)
     system_prompt = _with_attached_documents(system_prompt, attached_docs)
 
     async def event_generator():
+        nonlocal had_error
         try:
             async for event in run_agent_loop(
                 session_id=session_id,
@@ -223,22 +237,34 @@ async def chat_stream(
                 document_store=document_store,
                 tool_traces=new_traces,
             ):
+                if event.get("type") == "error":
+                    had_error = True
+
                 # 同步更新 assistant_display_msg
                 _apply_event_to_display(event, assistant_display_msg)
 
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
         except Exception as exc:
+            had_error = True
             logger.error("SSE generator error: %s", exc, exc_info=True)
             err_event = {"type": "error", "message": f"服务器内部错误：{exc}"}
             yield f"data: {json.dumps(err_event, ensure_ascii=False)}\n\n"
             done_event = {"type": "done"}
             yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
         finally:
-            # 保存更新后的 session（无论正常结束或出错）
+            if had_error:
+                session.raw_messages = raw_messages_before_turn
+                store.save(session)
+                return
+
+            # 本轮成功后统一提交 user / assistant / traces。
+            session.title = pending_title
+            session.display_messages.append(user_display_msg)
             session.display_messages.append(assistant_display_msg)
             session.tool_traces.extend(new_traces)
             store.save(session)
+            _schedule_memory_consolidation(client, model, store, memory_store)
 
     return StreamingResponse(
         event_generator(),
@@ -383,6 +409,27 @@ async def create_memory(
     )
     memory_store.save(memory)
     return _memory_response(memory)
+
+
+@router.post("/memories/consolidate")
+async def consolidate_memories(
+    force: bool = True,
+    store: SessionStore = Depends(get_store),
+    client: AsyncOpenAI = Depends(get_client),
+    model: str = Depends(get_model),
+    memory_store: MemoryStore = Depends(get_memory_store),
+):
+    try:
+        return await consolidate_sessions_to_memory(
+            client=client,
+            model=model,
+            session_store=store,
+            memory_store=memory_store,
+            force=force,
+        )
+    except Exception as exc:
+        logger.error("Memory consolidation failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"记忆整合失败：{exc}") from exc
 
 
 @router.delete("/memories/{memory_id}", status_code=204)
@@ -550,6 +597,34 @@ def _with_attached_documents(base_prompt: str, documents: list[Document]) -> str
             f"size={doc.size} content_type={doc.content_type}"
         )
     return base_prompt + "\n\n" + "\n".join(lines)
+
+
+def _schedule_memory_consolidation(
+    client: AsyncOpenAI,
+    model: str,
+    store: SessionStore,
+    memory_store: MemoryStore,
+) -> None:
+    if not should_consolidate_sessions(store, memory_store):
+        return
+
+    running_task = getattr(memory_store, "_consolidation_task", None)
+    if running_task is not None and not running_task.done():
+        return
+
+    async def _run() -> None:
+        try:
+            result = await consolidate_sessions_to_memory(
+                client=client,
+                model=model,
+                session_store=store,
+                memory_store=memory_store,
+            )
+            logger.info("Memory consolidation result: %s", result)
+        except Exception as exc:
+            logger.error("Memory consolidation failed: %s", exc, exc_info=True)
+
+    memory_store._consolidation_task = asyncio.create_task(_run())
 
 
 def _apply_event_to_display(event: dict, assistant_msg: dict) -> None:
