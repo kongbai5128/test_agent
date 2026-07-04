@@ -54,29 +54,14 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import MarkdownIt from 'markdown-it'
 import ToolCallCard from './ToolCallCard.vue'
+import { renderMarkdown } from '../utils/markdown'
 import type { ChatMessage } from '../types'
 
 const props = defineProps<{ msg: ChatMessage }>()
 
 const showThinking = ref(false)
-const markdown = new MarkdownIt({
-  html: false,
-  linkify: true,
-  breaks: true,
-})
-
-const defaultLinkOpen = markdown.renderer.rules.link_open
-markdown.renderer.rules.link_open = (tokens, idx, options, env, self) => {
-  tokens[idx].attrSet('target', '_blank')
-  tokens[idx].attrSet('rel', 'noopener noreferrer')
-  return defaultLinkOpen
-    ? defaultLinkOpen(tokens, idx, options, env, self)
-    : self.renderToken(tokens, idx, options)
-}
-
-const renderedContent = computed(() => markdown.render(props.msg.content || ''))
+const renderedContent = computed(() => renderMarkdown(props.msg.content || ''))
 
 function formatSize(size: number): string {
   if (size < 1024) return `${size} B`

@@ -1,4 +1,4 @@
-import { nextTick, ref } from 'vue'
+import { computed, nextTick, ref } from 'vue'
 import { api, parseSSEStream } from '../api'
 import { useSessionStore } from '../stores/sessions'
 import type { ChatMessage, DocumentAttachment, ToolCallInfo } from '../types'
@@ -8,21 +8,45 @@ import type { ChatMessage, DocumentAttachment, ToolCallInfo } from '../types'
  * 管理消息列表、SSE 流式接收、发送消息。
  */
 export function useChat(sessionId: () => string | null) {
-  const messages = ref<ChatMessage[]>([])
-  const isLoading = ref(false)
-  const streamError = ref<string | null>(null)
+  const messagesBySession = ref<Record<string, ChatMessage[]>>({})
+  const loadingBySession = ref<Record<string, boolean>>({})
+  const errorsBySession = ref<Record<string, string | null>>({})
+  const loadedSessions = new Set<string>()
   const sessionStore = useSessionStore()
+
+  const messages = computed(() => {
+    const id = sessionId()
+    return id ? (messagesBySession.value[id] ?? []) : []
+  })
+  const isLoading = computed(() => {
+    const id = sessionId()
+    return id ? !!loadingBySession.value[id] : false
+  })
+  const streamError = computed(() => {
+    const id = sessionId()
+    return id ? (errorsBySession.value[id] ?? null) : null
+  })
+
+  function ensureMessages(id: string) {
+    if (!messagesBySession.value[id]) {
+      messagesBySession.value[id] = []
+    }
+    return messagesBySession.value[id]
+  }
 
   /** 加载指定 session 的历史消息 */
   async function loadMessages(id: string) {
+    if (loadingBySession.value[id] && messagesBySession.value[id]?.length) return
+    if (loadedSessions.has(id) && messagesBySession.value[id]) return
     try {
       const raw = await api.getMessages(id)
-      messages.value = raw.map((m) => ({
+      messagesBySession.value[id] = raw.map((m) => ({
         ...m,
         status: 'done' as const,
         tool_calls: m.tool_calls ?? [],
         attachments: m.attachments ?? [],
       }))
+      loadedSessions.add(id)
     } catch (e) {
       console.error('loadMessages error:', e)
     }
@@ -32,10 +56,11 @@ export function useChat(sessionId: () => string | null) {
   async function sendMessage(content: string, attachments: DocumentAttachment[] = []) {
     const id = sessionId()
     const trimmed = content.trim()
-    if (!id || isLoading.value || (!trimmed && attachments.length === 0)) return
+    if (!id || loadingBySession.value[id] || (!trimmed && attachments.length === 0)) return
 
-    isLoading.value = true
-    streamError.value = null
+    loadingBySession.value[id] = true
+    errorsBySession.value[id] = null
+    const sessionMessages = ensureMessages(id)
 
     // 立即添加用户消息到列表
     const userMsg: ChatMessage = {
@@ -47,7 +72,7 @@ export function useChat(sessionId: () => string | null) {
       attachments,
       status: 'done',
     }
-    messages.value.push(userMsg)
+    sessionMessages.push(userMsg)
 
     // 创建待填充的 assistant 消息（status=streaming）
     const assistantMsg: ChatMessage = {
@@ -58,8 +83,8 @@ export function useChat(sessionId: () => string | null) {
       tool_calls: [],
       status: 'streaming',
     }
-    messages.value.push(assistantMsg)
-    const assistantIdx = messages.value.length - 1
+    sessionMessages.push(assistantMsg)
+    const assistantIdx = sessionMessages.length - 1
 
     await nextTick()
 
@@ -75,7 +100,8 @@ export function useChat(sessionId: () => string | null) {
       }
 
       for await (const event of parseSSEStream(response)) {
-        const msg = messages.value[assistantIdx]
+        const msg = sessionMessages[assistantIdx]
+        if (!msg) continue
 
         switch (event.type) {
           case 'thinking':
@@ -106,7 +132,7 @@ export function useChat(sessionId: () => string | null) {
           case 'error':
             msg.content = `❌ ${event.message}`
             msg.status = 'error'
-            streamError.value = event.message
+            errorsBySession.value[id] = event.message
             break
 
           case 'done':
@@ -115,7 +141,7 @@ export function useChat(sessionId: () => string | null) {
             }
             // 更新侧边栏消息计数
             sessionStore.patchLocal(id, {
-              message_count: messages.value.length,
+              message_count: sessionMessages.length,
               updated_at: new Date().toISOString(),
             })
             break
@@ -123,20 +149,26 @@ export function useChat(sessionId: () => string | null) {
       }
     } catch (e) {
       const errMsg = String(e)
-      messages.value[assistantIdx].content = `❌ 请求失败：${errMsg}`
-      messages.value[assistantIdx].status = 'error'
-      streamError.value = errMsg
+      if (sessionMessages[assistantIdx]) {
+        sessionMessages[assistantIdx].content = `❌ 请求失败：${errMsg}`
+        sessionMessages[assistantIdx].status = 'error'
+      }
+      errorsBySession.value[id] = errMsg
     } finally {
       // 确保状态清除
-      if (messages.value[assistantIdx]?.status === 'streaming') {
-        messages.value[assistantIdx].status = 'done'
+      if (sessionMessages[assistantIdx]?.status === 'streaming') {
+        sessionMessages[assistantIdx].status = 'done'
       }
-      isLoading.value = false
+      loadingBySession.value[id] = false
     }
   }
 
   function clearMessages() {
-    messages.value = []
+    const id = sessionId()
+    if (id) {
+      messagesBySession.value[id] = []
+      loadedSessions.delete(id)
+    }
   }
 
   return { messages, isLoading, streamError, loadMessages, sendMessage, clearMessages }

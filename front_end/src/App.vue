@@ -32,7 +32,7 @@ import type { SendPayload } from './types'
 const store = useSessionStore()
 const chatWindowRef = ref<InstanceType<typeof ChatWindow> | null>(null)
 
-const { messages, isLoading, loadMessages, sendMessage, clearMessages } = useChat(
+const { messages, isLoading, loadMessages, sendMessage } = useChat(
   () => store.activeId,
 )
 
@@ -48,16 +48,15 @@ onMounted(async () => {
 watch(
   () => store.activeId,
   async (id) => {
-    clearMessages()
     if (id) await loadMessages(id)
   },
 )
 
 // 消息更新时滚动到底部
 watch(
-  messages,
+  () => [store.activeId, messages.value.length],
   () => chatWindowRef.value?.scrollToBottom(),
-  { deep: true },
+  { flush: 'post' },
 )
 
 async function handleSend(payload: SendPayload) {
