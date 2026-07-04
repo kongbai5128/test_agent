@@ -20,7 +20,7 @@ from typing import Any, Literal
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
 MemoryType = Literal["user", "feedback", "project", "reference"]
 
-DREAM_MIN_HOURS_SINCE_LAST = 24
+DREAM_MIN_HOURS_SINCE_LAST = 1
 SESSION_DIGEST_MAX_CHARS = 24_000
 
 _CONSOLIDATE_SYSTEM_PROMPT = """\
@@ -298,6 +298,8 @@ def should_consolidate_sessions(
     *,
     min_hours_since_last: int = DREAM_MIN_HOURS_SINCE_LAST,
 ) -> bool:
+    # test
+    # return True
     sessions = [session for session in session_store.list_all() if session.raw_messages]
     current_count = len(sessions)
     if current_count <= 0:
